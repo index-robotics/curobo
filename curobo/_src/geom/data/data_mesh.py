@@ -133,7 +133,7 @@ class MeshData:
         """Initialize Warp device after dataclass creation."""
         if self._wp_device is None:
             object.__setattr__(
-                self, "_wp_device", wp.torch.device_from_torch(self.device_cfg.device)
+                self, "_wp_device", wp.device_from_torch(self.device_cfg.device)
             )
 
     # -------------------------------------------------------------------------
@@ -689,9 +689,11 @@ def compute_local_sdf_with_grad(
     # Signed distance: negative inside, positive outside
     signed_dist = dis_length * result.sign
 
-    # Gradient in local frame pointing toward obstacle
+    # Gradient in local frame: the direction that increases penetration, matching the
+    # cuboid convention (toward the surface outside, deeper inside). ``-delta`` for
+    # every point pointed AWAY from the surface outside, pulling spheres into meshes.
     grad_local = wp.vec3(0.0, 0.0, 0.0)
     if dis_length > _SDF_EPS:
-        grad_local = -delta / dis_length
+        grad_local = result.sign * delta / dis_length
 
     return wp.vec4(signed_dist, grad_local[0], grad_local[1], grad_local[2])
