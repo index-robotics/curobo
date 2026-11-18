@@ -74,7 +74,8 @@ __global__ void fused_coefficients_and_seed_bounds(const float *path, const floa
                                                    float *coefficients, const float *vlim,
                                                    const float *alim, const float *jlim,
                                                    const float *lower, const float *upper,
-                                                   float *out, int points, int dof, int batch_size,
+                                                   const float *inv_speed_sq, float *out,
+                                                   int points, int dof, int batch_size,
                                                    int tiles, int enable_inverse_dynamics) {
   const int item = blockIdx.x * blockDim.x + threadIdx.x, batch = blockIdx.y;
   const int count = points * dof;
@@ -96,6 +97,9 @@ __global__ void fused_coefficients_and_seed_bounds(const float *path, const floa
     if (v > 0.0f) hi = fminf(hi, (vlim[joint] / v) * (vlim[joint] / v));
     if (a > 0.0f) hi = fminf(hi, alim[joint] / a);
     if (j > 0.0f) hi = fminf(hi, powf(jlim[joint] / j, 2.0f / 3.0f));
+    // Per-sample path-speed bound: squared speed <= 1 / inv_speed_sq.
+    const float inv = inv_speed_sq[batch * points + item / dof];
+    if (inv > 0.0f) hi = fminf(hi, 1.0f / inv);
     if (dynamic != 0.0f) {
       const float left = (lower[joint] - g) / dynamic;
       const float right = (upper[joint] - g) / dynamic;
@@ -167,7 +171,8 @@ __device__ __forceinline__ float2 fused_seed(const float *bounds, const float2 *
 __global__ void fused_output(const float *timing, const float4 *basis, const int *first,
                              const float *path, const float *torque, const float *vlim,
                              const float *alim, const float *jlim, const float *lower,
-                             const float *upper, const float4 *time_basis, const int *time_first,
+                             const float *upper, const float *inv_speed_sq,
+                             const float4 *time_basis, const int *time_first,
                              const float *time_weights, float *partial_bounds, float *dt,
                              float *output, float *output_torque, int points, int dof,
                              int batch_size, int intervals, int tiles) {
@@ -195,6 +200,8 @@ __global__ void fused_output(const float *timing, const float4 *basis, const int
     if (v > 0.0f) hi = fminf(hi, (vlim[joint] / v) * (vlim[joint] / v));
     if (a > 0.0f) hi = fminf(hi, alim[joint] / a);
     if (j > 0.0f) hi = fminf(hi, powf(jlim[joint] / j, 2.0f / 3.0f));
+    const float inv = inv_speed_sq[batch * points + point];
+    if (inv > 0.0f) hi = fminf(hi, 1.0f / (inv * x));
     if (dynamic != 0.0f) {
       const float left = (lower[joint] - g) / dynamic, right = (upper[joint] - g) / dynamic;
       lo = fmaxf(lo, fminf(left, right));

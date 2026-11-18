@@ -250,3 +250,58 @@ def test_motion_planning_without_inverse_dynamics(
         ]))
         blocked = planner.plan_pose(goal_pose, start, max_attempts=1)
         assert blocked is None or not blocked.success.any()
+
+
+def test_motion_planning_timeopt_honors_tool_speed_and_custom_bound() -> None:
+    """Timeopt cruises at the validated tool speed limit and at a custom joint speed bound."""
+    from curobo._src.cost.criteria_tool_velocity_limit import ToolVelocityLimitCriteria
+    from curobo.content import get_task_configs_path
+
+    metrics = load_yaml(join_path(get_task_configs_path(), "metrics_base.yml"))
+    metrics["rollout"]["constraint_cfg"]["tool_velocity_limit_cfg"] = {"weight": [1.0, 1.0]}
+    config = MotionPlannerCfg.create(
+        "franka.yml", num_trajopt_seeds=2, trajopt_metrics_rollout=metrics, use_cuda_graph=True
+    )
+    with MotionPlanner(config) as planner:
+        start = JointState.from_position(
+            planner.default_joint_state.position.view(1, -1).clone(),
+            joint_names=planner.joint_names,
+        )
+        frame = planner.tool_frames[0]
+        goal = planner.compute_kinematics(start).tool_poses
+        goal.position[..., 2] -= 0.1
+
+        def plan() -> JointState:
+            result = planner.plan_pose(
+                goal.as_goal(), start, max_attempts=1, enable_graph_attempt=0
+            )
+            assert result is not None and result.success.item()
+            return result.get_interpolated_plan()
+
+        free_angular = torch.zeros(3, 3, device="cuda")
+        for cap in (0.05, 0.02):
+            criteria = ToolVelocityLimitCriteria.limit(
+                cap, 0.0, angular_projector=free_angular, device_cfg=planner.device_cfg
+            )
+            planner.trajopt_solver.update_tool_velocity_limit_criteria({frame: criteria})
+            plan_state = plan()
+            dof = len(planner.joint_names)
+            q = plan_state.position.reshape(-1, plan_state.position.shape[-1])
+            q = q[:, :dof].contiguous()
+            position = planner.compute_kinematics(
+                JointState.from_position(q, joint_names=planner.joint_names)
+            ).tool_poses.position.reshape(q.shape[0], -1, 3)[:, 0]
+            speed = (position[1:] - position[:-1]).norm(dim=-1) / plan_state.dt.reshape(-1)[0]
+            # Timeopt targets 99% of the limit; dense finite differences agree within 1%.
+            assert speed.max() <= cap
+            assert speed.max() >= 0.95 * cap
+            duration = plan_state.dt.reshape(-1)[0] * (position.shape[0] - 1)
+            assert 0.1 / cap <= duration <= 0.1 / cap + 1.0
+        planner.trajopt_solver.update_tool_velocity_limit_criteria(
+            {frame: ToolVelocityLimitCriteria.disabled(planner.device_cfg)}
+        )
+        joint_cap = 0.1
+        planner.trajopt_solver.path_speed_bound = (
+            lambda path: joint_cap / path[1].abs().amax(dim=-1)
+        )
+        assert plan().velocity.abs().max() <= joint_cap * 1.001

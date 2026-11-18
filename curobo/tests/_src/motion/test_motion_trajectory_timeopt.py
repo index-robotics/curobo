@@ -678,3 +678,35 @@ def test_timeopt_without_inverse_dynamics(
     samples = optimizer.sample(result.duration[:, None] * torch.linspace(0, 1, 1000, device="cuda"))
     for name, limit in (("velocity", 2.0), ("acceleration", 3.0), ("jerk", 50.0)):
         assert getattr(samples, name).abs().max() <= limit * 0.952
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_path_speed_bound(robot: KinematicsCfg, graph: bool) -> None:
+    """A per-sample path-speed bound caps joint speed, replays in place, and fails closed."""
+    timeopt = make_timeopt(robot, 2, graph)
+    controls, start, goal = inputs(2)
+    free = timeopt.timeopt(controls, start, goal).clone()
+    cap = torch.full((2, 1), 0.05, device="cuda")
+    # Constant joint speed cap expressed as ds/dt <= cap / |dq/ds|; inf where the path rests.
+    timeopt.set_path_speed_bound(lambda path: cap / path[1, ..., 0].abs())
+    for value in (0.05, 0.03):
+        cap.fill_(value)
+        result = timeopt.timeopt(controls, start, goal)
+        assert result.success.all(), result.status
+        assert result.joint_state.velocity.abs().max() <= value * (1 + 1e-4)
+        assert result.joint_state.velocity.abs().max() >= value * 0.99
+        times = result.duration[:, None] * torch.linspace(0, 1, 1000, device="cuda")
+        # Only grid samples are certified; dense samples overshoot by a fraction of a percent.
+        assert timeopt.sample(times).velocity.abs().max() <= value * 1.005
+        assert (result.duration >= goal[:, 0] / value).all()
+    cap.fill_(0.0)
+    assert not timeopt.timeopt(controls, start, goal).success.any()
+    cap.fill_(torch.nan)
+    assert not timeopt.timeopt(controls, start, goal).success.any()
+    # An unbounded bound, and removing the bound, reproduce the free timing bit for bit.
+    cap.fill_(torch.inf)
+    for bound in (timeopt._path_speed_bound, None):
+        timeopt.set_path_speed_bound(bound)
+        result = timeopt.timeopt(controls, start, goal)
+        assert torch.equal(result.timing_controls, free.timing_controls)
+        assert torch.equal(result.time, free.time)

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+from typing import Callable
 
 import numpy as np
 import torch
@@ -21,6 +22,10 @@ from curobo._src.trajectory.timeopt.timeopt_solver import CudaTimeOptSolver
 from curobo._src.types.spline_layout import MAX_SPLINE_KNOTS
 from curobo._src.util.cuda_graph_util import GraphExecutor
 from curobo._src.util.logging import log_and_raise
+
+PathSpeedBound = Callable[[torch.Tensor], torch.Tensor]
+"""Map path [4,B,G,D] (q and its first three s-derivatives on ``constraint_grid``) to the
+largest admissible path speed ds/dt [B,G]; inf leaves a sample unbounded."""
 
 
 class TrajectoryTimeOpt:
@@ -166,7 +171,20 @@ class TrajectoryTimeOpt:
         )
         self._sample_count: int | None = None
         self._sample_progress: torch.Tensor | None = None
+        self._path_speed_bound: PathSpeedBound | None = None
         self._setup_path(reference=False)
+
+    def set_path_speed_bound(self, bound: PathSpeedBound | None) -> None:
+        """Install a per-sample path-speed bound, evaluated on the sampled path in every solve.
+
+        The bound runs inside the captured graph, so it must be capture-safe: fixed shapes,
+        no host synchronization, and state read from fixed-address tensors.
+        """
+        if bound is self._path_speed_bound:
+            return
+        self._path_speed_bound = bound
+        self._evaluation.inv_speed_sq.zero_()
+        self.reset_cuda_graph()
 
     def _setup_path(self, reference: bool) -> None:
         """Allocate the shared sampling/solver grid, retaining the reference start span."""
@@ -256,6 +274,10 @@ class TrajectoryTimeOpt:
             self._qdd,
             int(not self._reference),
         )
+        if self._path_speed_bound is not None:
+            inv = self._path_speed_bound(self._path).square().reciprocal()
+            # A NaN bound must fail validation rather than silently disable the row.
+            self._evaluation.inv_speed_sq.copy_(inv.nan_to_num(nan=math.inf, posinf=math.inf))
         torque = (
             self._coefficients
             if self._dynamics is None

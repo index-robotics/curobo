@@ -10,7 +10,8 @@ __global__ void fused_prepare(const int2 *meta, const int *offsets, const float4
                               const float *path,
                               const float *torque, const float *vlim, const float *alim,
                               const float *jlim, const float *lower, const float *upper,
-                              const float *seed_bounds, const float2 *reference_speed, float *state,
+                              const float *inv_speed_sq, const float *seed_bounds,
+                              const float2 *reference_speed, float *state,
                               bool *feasible, bool *numerical, float *uniform, float4 *rows,
                               float *bounds, int points, int dof, int batch_size, int tiles,
                               int seed_tiles) {
@@ -40,9 +41,14 @@ __global__ void fused_prepare(const int2 *meta, const int *offsets, const float4
     const float tau_scale = fmaxf(fmaxf(fabsf(lower[joint]), fabsf(upper[joint])), 1e-12f);
     upper_bound = (upper[joint] - gravity) / tau_scale;
     lower_bound = (gravity - lower[joint]) / tau_scale;
+    // Both bounds have the form c * squared_speed <= 1, so the larger c is exact.
+    // The path-speed bound rides on one record per sample.
+    const float inv = joint == 0 ? inv_speed_sq[batch * points + point] : 0.0f;
+    const bool speed_bound = inv > q1 * q1 / (vlim[joint] * vlim[joint]);
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-      a[0][k] = seed.x * (q1 * q1 * n[k] / (vlim[joint] * vlim[joint]));
+      a[0][k] = speed_bound ? seed.x * (inv * n[k])
+                            : seed.x * (q1 * q1 * n[k] / (vlim[joint] * vlim[joint]));
       a[1][k] = seed.x * ((q2 * n[k] + 0.5f * q1 * np[k]) / alim[joint]);
       a[2][k] = seed.x * ((0.5f * dynamic_a * np[k] + dynamic_b * n[k]) / tau_scale);
       a[3][k] = seed.x * ((q3 * n[k] + 1.5f * q2 * np[k] + 0.5f * q1 * npp[k]) / jlim[joint]);

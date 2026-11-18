@@ -64,3 +64,5 @@ class TimeOptProblem:
         self.grid_cpu = grid
         self.num_intervals = num_intervals
         self.stationary = torch.zeros(self.batch_size, dtype=torch.bool, device=path.device)
+        # Per-sample 1 / max squared path speed [B,G]; zero leaves a sample unbounded.
+        self.inv_speed_sq = path.new_zeros((self.batch_size, path.shape[2]))

@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
-from curobo._src.motion.motion_trajectory_timeopt import TrajectoryTimeOpt
+from curobo._src.motion.motion_trajectory_timeopt import PathSpeedBound, TrajectoryTimeOpt
 from curobo._src.motion.motion_trajectory_timeopt_cfg import TrajectoryTimeOptCfg
+from curobo._src.robot.kinematics.kinematics import Kinematics
 from curobo._src.rollout.metrics import RolloutMetrics
 from curobo._src.state.state_joint import JointState
 from curobo._src.state.state_joint_ops import repeat_joint_state_seeds
@@ -48,6 +49,9 @@ def trajectory_validation_masks(
 class TimeOptSolver:
     """Optimize timing and validate all retained seeds without changing their geometry."""
 
+    tool_speed_margin = 0.99
+    """Fraction of each tool speed limit timeopt targets; the grid is sampled, validation dense."""
+
     def __init__(self, solver: TrajOptSolver, lanes: int) -> None:
         """Allocate fixed-shape timeopt and executable-trajectory buffers."""
         if solver.transition_model.control_space != ControlSpace.BSPLINE_3:
@@ -74,6 +78,61 @@ class TimeOptSolver:
             log_and_raise("TimeOpt requires interpolation_buffer_size >= 2")
         self._sample_index = torch.arange(capacity, **solver.device_cfg.as_torch_dict())[None]
         self._sample_dt = torch.zeros(lanes, **solver.device_cfg.as_torch_dict())
+        self._trajopt = solver
+        # Bound timing by the same tool speed criteria the validation rollout checks.
+        self._tool_speed_costs = [
+            manager.get_cost("tool_velocity_limit")
+            for manager in (
+                self.rollout.metrics_constraint_manager,
+                self.rollout.metrics_hybrid_cost_constraint_manager,
+                self.rollout.metrics_cost_manager,
+            )
+            if manager is not None and manager.has_cost("tool_velocity_limit")
+        ]
+        self._kinematics = (
+            Kinematics(solver.kinematics.config, compute_jacobian=True, compute_spheres=False)
+            if self._tool_speed_costs
+            else None
+        )
+        self._tool_bound = self.tool_speed_bound
+        self._bound_key: tuple = (None, ())
+
+    def tool_speed_bound(self, path: torch.Tensor) -> torch.Tensor:
+        """Largest path speed [B,G] keeping every enabled projected tool speed within its limit."""
+        q, dq = path[0], path[1]
+        jacobians = self._kinematics.compute_kinematics(JointState(position=q)).tool_jacobians
+        twist = (jacobians @ dq[:, :, None, :, None])[..., 0]  # Tool twist per unit ds/dt.
+        bound = torch.full_like(q[..., 0], torch.inf)
+        for cost in self._tool_speed_costs:
+            if not cost.enabled:
+                continue
+            criteria = cost._stacked_tool_velocity_limit_criteria
+            for part, kind in ((twist[..., :3], "linear"), (twist[..., 3:], "angular")):
+                projector = getattr(criteria, kind + "_projector")
+                scale = getattr(criteria, kind + "_axis_scale")
+                limit = getattr(criteria, "max_" + kind + "_speed")
+                speed = (scale * (projector @ part[..., None])[..., 0]).norm(dim=-1)
+                link = torch.where(
+                    speed > 0, self.tool_speed_margin * limit / speed, torch.inf
+                )
+                bound = torch.minimum(bound, link.amin(dim=-1))
+        return bound
+
+    def _set_path_speed_bound(self) -> None:
+        """Combine the TrajOpt solver's custom bound with enabled tool speed criteria."""
+        custom = self._trajopt.path_speed_bound
+        enabled = tuple(cost.enabled for cost in self._tool_speed_costs)
+        if (custom, enabled) == self._bound_key:
+            return
+        self._bound_key = (custom, enabled)
+        bounds = [b for b in (custom, self._tool_bound if any(enabled) else None) if b]
+        bound: Optional[PathSpeedBound] = bounds[0] if bounds else None
+        if len(bounds) == 2:
+
+            def bound(path: torch.Tensor) -> torch.Tensor:
+                return torch.minimum(bounds[0](path), bounds[1](path))
+
+        self.optimizer.set_path_speed_bound(bound)
 
     def timeopt(
         self, native: JointState, current_state: JointState, num_seeds: int
@@ -83,6 +142,7 @@ class TimeOptSolver:
         Counts include the exact endpoint. Each trajectory has uniform dt no larger
         than the requested interpolation_dt. Buffer overflow rejects a seed.
         """
+        self._set_path_speed_bound()
         start = repeat_joint_state_seeds(current_state, num_seeds)
         timeopt = self.optimizer.timeopt(
             native.knot.contiguous(),

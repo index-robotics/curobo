@@ -33,6 +33,7 @@ from curobo._src.solver.processor_trajopt_result import (
 from curobo._src.solver.solve_mode import SolveMode
 from curobo._src.solver.solve_state import SolveState
 from curobo._src.solver.solver_core import SolverCore
+from curobo._src.motion.motion_trajectory_timeopt import PathSpeedBound
 from curobo._src.solver.solver_timeopt import TimeOptSolver, trajectory_validation_masks
 from curobo._src.solver.solver_trajopt_cfg import TrajOptSolverCfg
 from curobo._src.trajectory.trajectory_spline_export import native_spline
@@ -67,6 +68,8 @@ class TrajOptSolver:
         """Initializes the TrajOpt solver."""
         self.config = config
         self._timeopt: Optional[TimeOptSolver] = None
+        self.path_speed_bound: Optional[PathSpeedBound] = None
+        """Custom timeopt path-speed bound, combined (min) with tool speed criteria."""
         self.core = SolverCore(config.core_cfg, scene_collision_checker)
 
         # TrajOpt needs an additional interpolated rollout
